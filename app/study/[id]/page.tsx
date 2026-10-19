@@ -8,6 +8,8 @@ import { parsePastedTranscript, toSentences, fmtTime, needsPunctuation, plainTex
 import { buildPrompt, buildPunctuatePrompt, parseAnalysis, toPlatformFormat, mergeAnalysis, CHUNK, type Analysis, type Expression } from "@/lib/prompt";
 import { mergeWithPrev, splitAt } from "@/lib/edit";
 import { recordings, canRecord, startRecording } from "@/lib/recordings";
+import { alignSentences, type SiteLesson } from "@/lib/siteImport";
+import { takePendingLesson } from "@/lib/handoff";
 
 type Tab = "watch" | "drill" | "expr";
 type Load = { state: "loading" } | { state: "ready" } | { state: "paste"; reason: string; title: string };
@@ -38,10 +40,31 @@ export default function StudyPage() {
     store.putVideo(v);
   }, []);
 
-  // 저장된 기록 → 없으면 자막 자동 불러오기 → 실패하면 붙여넣기
+  const lessonRef = useRef<SiteLesson | null>(null);
+  const [notice, setNotice] = useState("");
+
+  const makeRecord = useCallback((base: Sentence[], title: string, auto: boolean, lesson: SiteLesson | null): VideoRecord => {
+    const prev = store.video(id);
+    return {
+      id,
+      title: lesson?.title || title || prev?.title || "",
+      auto: lesson ? false : auto,
+      sentences: lesson ? alignSentences(base, lesson.sentences) : base,
+      site: lesson ? { url: lesson.url, vocab: lesson.vocab, pronunciation: lesson.pronunciation, summary: lesson.summary } : undefined,
+      punctFixed: !!lesson,
+      done: [],
+      cursor: 0,
+      addedAt: prev?.addedAt ?? Date.now(),
+      lastAt: Date.now(),
+    };
+  }, [id]);
+
+  // 저장된 기록 → 없으면 자막 자동 불러오기(+쉐도잉 사이트 레슨) → 실패하면 붙여넣기
   useEffect(() => {
+    const src = new URLSearchParams(window.location.search).get("src");
+    const pending = takePendingLesson(id);
     const saved = store.video(id);
-    if (saved) {
+    if (saved && !pending && !(src && !saved.site)) {
       setRec(saved);
       setLoad({ state: "ready" });
       if (saved.done.length > 0) setTab("drill");
@@ -49,25 +72,32 @@ export default function StudyPage() {
     }
     let dead = false;
     (async () => {
-      try {
-        const r = await fetch(`/api/transcript?v=${id}`);
-        const j = await r.json();
-        if (dead) return;
-        if (!r.ok || !j.sentences?.length) {
-          setLoad({ state: "paste", reason: REASONS[j.error] ?? REASONS.fetch_failed, title: j.title ?? "" });
-          return;
+      const tP = fetch(`/api/transcript?v=${id}`).then(async (r) => ({ ok: r.ok, j: await r.json() })).catch(() => ({ ok: false, j: { error: "network" } }));
+      let lesson: SiteLesson | null = pending;
+      if (!lesson && src) {
+        try {
+          const r = await fetch(`/api/import?url=${encodeURIComponent(src)}`);
+          if (r.ok) lesson = await r.json();
+          else setNotice("쉐도잉 사이트에서 레슨을 가져오지 못했어요. 그 페이지를 Ctrl+S로 저장한 파일을 홈에서 올리면 돼요. 지금은 유튜브 자막으로만 진행해요.");
+        } catch {
+          setNotice("쉐도잉 사이트에 연결하지 못했어요. 그 페이지를 Ctrl+S로 저장한 파일을 홈에서 올리면 돼요.");
         }
-        const v: VideoRecord = { id, title: j.title ?? "", auto: !!j.auto, sentences: j.sentences, done: [], cursor: 0, addedAt: Date.now(), lastAt: Date.now() };
-        save(v);
-        setLoad({ state: "ready" });
-      } catch {
-        if (!dead) setLoad({ state: "paste", reason: REASONS.network, title: "" });
       }
+      lessonRef.current = lesson;
+      const t = await tP;
+      if (dead) return;
+      if (!t.ok || !t.j.sentences?.length) {
+        const reason = (REASONS[t.j.error] ?? REASONS.fetch_failed) + (lesson ? ` 사이트 문장 ${lesson.sentences.length}개는 가져왔어요. 유튜브 자막을 붙여넣으면 문장마다 시간을 맞춰요.` : "");
+        setLoad({ state: "paste", reason, title: lesson?.title || t.j.title || "" });
+        return;
+      }
+      save(makeRecord(t.j.sentences, t.j.title ?? "", !!t.j.auto, lesson));
+      setLoad({ state: "ready" });
     })();
     return () => {
       dead = true;
     };
-  }, [id, save]);
+  }, [id, save, makeRecord]);
 
   useEffect(() => {
     if (yt.ready) yt.setRate(tab === "watch" ? 1 : settings.rate);
@@ -95,12 +125,13 @@ export default function StudyPage() {
         )}
       </div>
 
+      {notice && <div className="body" style={{ paddingBottom: 0 }}><div className="err">{notice}</div></div>}
       {load.state === "loading" && <div className="body"><p className="muted">자막을 불러오는 중...</p></div>}
       {load.state === "paste" && (
         <PasteTranscript
           reason={load.reason}
           onDone={(sentences) => {
-            save({ id, title: load.title, auto: false, sentences, done: [], cursor: 0, addedAt: Date.now(), lastAt: Date.now() });
+            save(makeRecord(sentences, load.title, false, lessonRef.current));
             setLoad({ state: "ready" });
           }}
         />
@@ -192,6 +223,7 @@ function WatchTab({ rec, yt, settings, setSettings, onPick }: { rec: VideoRecord
           먼저 끝까지 들으면서 자막을 읽어요. {stats.wpm >= 160 ? "말이 빠른 편이라 따라하기는 0.75배속으로 시작해 보세요." : stats.wpm < 120 ? "말이 느린 편이라 처음 시작하기 좋아요." : "보통 속도예요."}
           {rec.auto && " 자동 생성 자막이라 문장이 어색하게 나뉜 곳은 따라하기 탭에서 고칠 수 있어요."}
         </p>
+        {rec.site && <p className="small muted" style={{ margin: 0 }}>쉐도잉 사이트에서 가져온 문장이에요. 시간은 유튜브 자막에 맞췄어요. 어긋난 문장은 따라하기 탭에서 나누거나 합칠 수 있어요.</p>}
       </div>
       <div className="toggles card">
         <label>한국어 번역 같이 보기{!tr.length && <span className="small muted"> (표현 탭에서 분석하면 생겨요)</span>}
@@ -353,6 +385,20 @@ function DrillTab({ rec, save, yt, settings, setSettings }: { rec: VideoRecord; 
           <button className="btn" onClick={() => setEditing((e) => !e)}>{editing ? "편집 닫기" : "문장 나누기·합치기"}</button>
         </div>
       </div>
+
+      {(() => {
+        const hits = (rec.site?.vocab ?? []).filter((v) => new RegExp(`\\b${v.word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i").test(s.text));
+        return hits.length > 0 ? (
+          <div className="card" style={{ gap: 6 }}>
+            <div className="lab" style={{ fontSize: 11, color: "var(--muted)", fontWeight: 700, letterSpacing: "0.06em" }}>이 문장의 발음</div>
+            {hits.map((v) => (
+              <div key={v.word} className="row" style={{ gap: 10 }}>
+                <b>{v.word}</b><span className="mono small">{v.ipa}</span><span className="small muted">{v.meaning}</span>
+              </div>
+            ))}
+          </div>
+        ) : null;
+      })()}
 
       {tip && (
         <div className="notice">
@@ -517,6 +563,7 @@ function ExprTab({ rec, save, yt }: { rec: VideoRecord; save: (v: VideoRecord) =
 
   return (
     <div className="body">
+      {rec.site && <SiteLessonCard site={rec.site} />}
       <div className="card">
         <h2 style={{ fontSize: 17 }}>쓸 만한 표현 뽑기</h2>
         <p className="small muted" style={{ margin: 0 }}>
@@ -612,6 +659,39 @@ function ExprTab({ rec, save, yt }: { rec: VideoRecord; save: (v: VideoRecord) =
         </div>
       )}
       {a && <ResetButton onReset={() => save({ ...rec, analysis: undefined })} />}
+    </div>
+  );
+}
+
+function SiteLessonCard({ site }: { site: NonNullable<VideoRecord["site"]> }) {
+  return (
+    <div className="card">
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <h2 style={{ fontSize: 17 }}>가져온 어휘·발음</h2>
+        <a className="small" href={site.url} target="_blank" rel="noopener">원본 ↗</a>
+      </div>
+      {site.summary && <p className="small muted" style={{ margin: 0 }}>{site.summary}</p>}
+      {site.vocab.length > 0 && (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+            <tbody>
+              {site.vocab.map((v) => (
+                <tr key={v.word} style={{ borderTop: "1px solid var(--line)" }}>
+                  <td style={{ padding: "6px 4px", fontWeight: 600 }}>{v.word} <span className="small muted">{v.pos}</span></td>
+                  <td style={{ padding: "6px 4px" }} className="mono small">{v.ipa}</td>
+                  <td style={{ padding: "6px 4px" }} className="small">{v.meaning}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {site.pronunciation.length > 0 && (
+        <>
+          <div className="lab" style={{ fontSize: 11, color: "var(--muted)", fontWeight: 700, letterSpacing: "0.06em" }}>주의할 발음</div>
+          {site.pronunciation.map((p, k) => <p key={k} className="small" style={{ margin: 0 }}>{p}</p>)}
+        </>
+      )}
     </div>
   );
 }

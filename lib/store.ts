@@ -2,6 +2,7 @@
 // 이 기기 브라우저(localStorage)에 학습 기록을 저장한다.
 import type { Sentence } from "./transcript";
 import type { Analysis, Expression } from "./prompt";
+import type { VocabItem } from "./siteImport";
 
 export type VideoRecord = {
   id: string;
@@ -11,6 +12,8 @@ export type VideoRecord = {
   analysis?: Analysis;
   /** 문장부호를 넣어 다시 나눴거나, 그대로 쓰기로 함 */
   punctFixed?: boolean;
+  /** 다른 쉐도잉 사이트에서 가져온 레슨 정보 */
+  site?: { url: string; vocab: VocabItem[]; pronunciation: string[]; summary: string };
   done: number[];
   cursor: number;
   addedAt: number;

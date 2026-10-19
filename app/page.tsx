@@ -4,6 +4,8 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { parseYouTubeId, fmtTime, decodeEntities } from "@/lib/transcript";
 import { store, type VideoRecord } from "@/lib/store";
+import { isSiteLesson, parseLessonHtml } from "@/lib/siteImport";
+import { putPendingLesson } from "@/lib/handoff";
 
 const TOPICS: { label: string; q: string }[] = [
   { label: "UX·디자인", q: "UX designer day in the life" },
@@ -62,7 +64,7 @@ export default function Home() {
     e.preventDefault();
     const id = parseYouTubeId(url);
     if (!id) return setUrlErr("유튜브 링크를 확인해 주세요. 예: https://youtu.be/xxxxxxxxxxx");
-    router.push(`/study/${id}`);
+    router.push(isSiteLesson(url) ? `/study/${id}?src=${encodeURIComponent(url.trim())}` : `/study/${id}`);
   };
 
   return (
@@ -83,6 +85,21 @@ export default function Home() {
           <button className="btn primary" type="submit">시작</button>
         </div>
         {urlErr && <div className="err">{urlErr}</div>}
+        <p className="small muted" style={{ margin: 0 }}>
+          쉐도잉 사이트(shadowingenglish.com) 레슨 링크를 넣으면 그 사이트의 문장 구분과 어휘·발음을 그대로 가져와요.
+        </p>
+        <label className="small" style={{ color: "var(--accent)", cursor: "pointer" }}>
+          링크로 안 되면: 저장한 레슨 페이지 파일(.html) 올리기
+          <input type="file" accept=".html,.htm,text/html" style={{ display: "none" }} onChange={async (e) => {
+            const f = e.target.files?.[0];
+            e.target.value = "";
+            if (!f) return;
+            const lesson = parseLessonHtml(await f.text());
+            if (!lesson.videoId || !lesson.sentences.length) return setUrlErr("이 파일에서 레슨 문장을 찾지 못했어요. 레슨 페이지를 '웹페이지, 전체'로 저장했는지 확인해 주세요.");
+            putPendingLesson(lesson);
+            router.push(`/study/${lesson.videoId}`);
+          }} />
+        </label>
       </form>
 
       {library.length > 0 && (
