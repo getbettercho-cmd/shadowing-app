@@ -94,3 +94,45 @@ test("abbreviations and numbers don't split", () => {
   const s = toSentences(parseCaptionPayload(xml));
   assert.equal(s.length, 2, JSON.stringify(s));
 });
+
+import { readFileSync } from "node:fs";
+import { applyPunctuation, needsPunctuation, plainText } from "../lib/transcript.ts";
+
+const friends = readFileSync(new URL("./fixture-friends-paste.txt", import.meta.url), "utf8");
+
+test("pasted transcript with chapter titles and UI text", () => {
+  const cues = parsePastedTranscript(friends);
+  const all = cues.map((c) => c.text).join(" ");
+  assert.ok(!/챕터|동기화|Thanksgiving plans/.test(all), all);
+  assert.equal(cues[0].start, 1);
+  assert.ok(cues.at(-1)!.text === "lunar");
+});
+
+test("unpunctuated transcript is detected and re-split with AI punctuation", () => {
+  const sentences = toSentences(parsePastedTranscript(friends));
+  assert.ok(needsPunctuation(sentences));
+  const src = plainText(sentences);
+  // AI가 문장부호를 찍고, 이름 철자를 고치고(Tribbiani), 단어 하나를 빼고(and), 하나를 더한(oh) 경우
+  const ai = src
+    .replace("hey hey hey and this from", "Hey, hey, hey. This from")
+    .replace("Department are you wearing makeup yes I am", "Department! Are you wearing makeup? Yes, I am.")
+    .replace("as of today I am officially Joey triani actor/model thank you", "As of today, I am officially Joey Tribbiani, actor/model. Thank you.")
+    .replace("that's so funny cuz I was thinking you look more like Joey triani man/woman", "That's so funny, cuz I was thinking you look more like Joey Tribbiani, man/woman.")
+    .replace("what were you modeling for", "What were you modeling for?")
+    .replace("how can they do this to us huh", "How can they do this to us, huh? Oh,")
+    .replace("lumps Joey you're going home right", "lumps. Joey, you're going home, right?");
+  const out = applyPunctuation(sentences, ai);
+  const texts = out.map((s) => s.text);
+  assert.ok(texts.includes("Are you wearing makeup?"), texts.join("\n"));
+  assert.ok(texts.includes("Yes, I am."), texts.join("\n"));
+  assert.ok(texts.includes("What were you modeling for?"), texts.join("\n"));
+  assert.ok(texts.some((t) => t.startsWith("As of today, I am officially Joey Triani,")), texts.join("\n"));
+  assert.ok(texts.includes("Joey, you're going home, right?"), texts.join("\n"));
+  assert.ok(texts.includes("And this from the cry for Health Department!"), texts.join("\n"));
+  // 단어 순서와 개수는 원래 그대로
+  assert.equal(out.map((s) => s.text).join(" ").replace(/[^a-z ]/gi, "").toLowerCase(), src.replace(/[^a-z ]/gi, "").toLowerCase());
+  // 시간은 단조 증가, 'Are you wearing makeup?'은 0:01~0:19 사이
+  const m = out.find((s) => s.text === "Are you wearing makeup?")!;
+  assert.ok(m.start > 1 && m.end < 19, JSON.stringify(m));
+  for (let k = 1; k < out.length; k++) assert.ok(out[k].start >= out[k - 1].start);
+});

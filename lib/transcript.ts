@@ -120,7 +120,7 @@ export function parsePastedTranscript(text: string): Cue[] {
   const pushed: { start: number; text: string }[] = [];
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    if (!line || durationLabel.test(line)) continue;
+    if (!line || durationLabel.test(line) || isUiLine(line)) continue;
     if (tsOnly.test(line)) {
       if (cur) pushed.push(cur);
       cur = { start: tsToSec(line), text: "" };
@@ -143,6 +143,15 @@ export function parsePastedTranscript(text: string): Cue[] {
       return { start: p.start, dur: Math.min(gap, Math.max(est, 1.5)), text: p.text };
     }),
   );
+}
+
+/** 유튜브 스크립트 패널에서 같이 복사되는 화면 글자(챕터 제목, 버튼 등) */
+function isUiLine(line: string): boolean {
+  if (/^(챕터|chapter)\s*\d+\s*[:：]/i.test(line)) return true;
+  if (/^(동영상 시간 동기화|sync to video time|스크립트|transcript|검색|search|더보기|show more)$/i.test(line)) return true;
+  // 영어 영상 자막에 한글만 있는 줄은 화면 글자로 본다
+  if (/[가-힣]/.test(line) && !/[a-z]{2,}/i.test(line)) return true;
+  return false;
 }
 
 const ABBREV = new Set(["mr.", "mrs.", "ms.", "dr.", "st.", "vs.", "e.g.", "i.e.", "etc.", "u.s.", "jr.", "sr.", "inc.", "co."]);
@@ -181,7 +190,7 @@ export function toSentences(cues: Cue[], opts: { maxWords?: number; maxSec?: num
   const maxSec = opts.maxSec ?? 9;
   const words = toWords(cues);
   if (!words.length) return [];
-  const punctuated = words.filter((w) => endsSentence(w.w)).length >= Math.max(2, words.length / 40);
+  const punctuated = isPunctuatedWords(words.map((w) => w.w));
 
   // 자막 줄 경계(시간 공백) 계산용
   const gapAfter = (k: number) => (k + 1 < words.length ? words[k + 1].t0 - words[k].t1 : 99);
@@ -245,4 +254,77 @@ const round = (n: number) => Math.round(n * 100) / 100;
 export function fmtTime(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function isPunctuatedWords(ws: string[]): boolean {
+  return ws.filter((w) => endsSentence(w)).length >= Math.max(2, ws.length / 40);
+}
+
+/** 문장부호가 거의 없는 자막(자동 생성 자막)인지 */
+export function needsPunctuation(sentences: { text: string }[]): boolean {
+  const ws = sentences.flatMap((s) => s.text.split(" ").filter(Boolean));
+  return ws.length >= 8 && !isPunctuatedWords(ws);
+}
+
+/** AI에 보낼 원문. 줄마다 나누지 않고 이어 붙인다 */
+export function plainText(sentences: { text: string }[]): string {
+  return sentences.map((s) => s.text).join(" ");
+}
+
+const norm = (w: string) => w.toLowerCase().replace(/[^a-z0-9']/g, "").replace(/'/g, "");
+
+/**
+ * AI가 문장부호를 찍어 준 텍스트를 원래 단어(시간 정보가 있는)에 맞춰 붙이고 문장을 다시 나눈다.
+ * AI가 단어를 빼거나 더하거나 고쳐도 앞뒤 몇 단어 안에서 맞춰 본다.
+ */
+export function applyPunctuation(sentences: Sentence[], punctuated: string): Sentence[] {
+  const cues: Cue[] = sentences.map((s) => ({ start: s.start, end: s.end, text: s.text }));
+  const words = toWords(cues);
+  const ret = punctuated.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  const out = words.map((w) => ({ ...w }));
+  let i = 0;
+  let j = 0;
+  const W = 6;
+  while (i < words.length && j < ret.length) {
+    const a = norm(words[i].w);
+    const b = norm(ret[j]);
+    if (a === b || !b) {
+      if (b) out[i].w = ret[j];
+      i++;
+      j++;
+      continue;
+    }
+    let moved = false;
+    for (let k = 1; k <= W && !moved; k++) {
+      if (j + k < ret.length && norm(ret[j + k]) === a) {
+        // AI가 단어를 추가함 → 추가된 단어의 문장부호만 앞 단어에 옮긴다
+        const p = ret[j + k - 1].match(/[.?!]$/);
+        if (p && i > 0 && !/[.?!]$/.test(out[i - 1].w)) out[i - 1].w += p[0];
+        j += k;
+        moved = true;
+      } else if (i + k < words.length && norm(words[i + k].w) === b) {
+        // AI가 단어를 뺌 → 원래 단어는 유지. 문장 첫머리였다면 대문자를 앞으로 옮긴다
+        const startsSentence = i === 0 || /[.?!]$/.test(out[i - 1].w);
+        if (startsSentence && /^[A-Z]/.test(ret[j]) && ret[j] !== "I" && !/^I'/.test(ret[j])) {
+          out[i].w = out[i].w.charAt(0).toUpperCase() + out[i].w.slice(1);
+          ret[j] = ret[j].charAt(0).toLowerCase() + ret[j].slice(1);
+        }
+        i += k;
+        moved = true;
+      }
+    }
+    if (!moved) {
+      // 단어를 고쳐 씀 → 원래 단어에 AI의 문장부호·대문자만 반영
+      const p = ret[j].match(/[.,?!]+$/)?.[0] ?? "";
+      const cap = /^[A-Z]/.test(ret[j]);
+      let w = words[i].w.replace(/[.,?!]+$/, "");
+      if (cap) w = w.charAt(0).toUpperCase() + w.slice(1);
+      out[i].w = w + p;
+      i++;
+      j++;
+    }
+  }
+  // 단어 단위 시간을 그대로 쓰는 Cue로 만들어 다시 나눈다
+  const wordCues: Cue[] = out.map((w) => ({ start: w.t0, end: w.t1, text: w.w }));
+  return toSentences(wordCues);
 }

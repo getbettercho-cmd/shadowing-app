@@ -9,6 +9,8 @@ export type VideoRecord = {
   auto: boolean;
   sentences: Sentence[];
   analysis?: Analysis;
+  /** 문장부호를 넣어 다시 나눴거나, 그대로 쓰기로 함 */
+  punctFixed?: boolean;
   done: number[];
   cursor: number;
   addedAt: number;

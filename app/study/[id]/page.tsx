@@ -4,8 +4,8 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import { useYouTube, sleep } from "@/lib/useYouTube";
 import { store, type VideoRecord, type Settings, DEFAULT_SETTINGS } from "@/lib/store";
-import { parsePastedTranscript, toSentences, fmtTime, type Sentence } from "@/lib/transcript";
-import { buildPrompt, parseAnalysis, toPlatformFormat, mergeAnalysis, CHUNK, type Analysis, type Expression } from "@/lib/prompt";
+import { parsePastedTranscript, toSentences, fmtTime, needsPunctuation, plainText, applyPunctuation, type Sentence } from "@/lib/transcript";
+import { buildPrompt, buildPunctuatePrompt, parseAnalysis, toPlatformFormat, mergeAnalysis, CHUNK, type Analysis, type Expression } from "@/lib/prompt";
 import { mergeWithPrev, splitAt } from "@/lib/edit";
 import { recordings, canRecord, startRecording } from "@/lib/recordings";
 
@@ -78,7 +78,7 @@ export default function StudyPage() {
       <div className="sticky">
         <div className="topbar">
           <Link href="/" className="btn ghost" aria-label="처음으로">←</Link>
-          <div className="title grow">{rec?.title || (load.state === "paste" ? load.title : "") || "불러오는 중"}</div>
+          <div className="title grow">{rec?.title || (load.state === "paste" ? load.title : "") || (load.state === "loading" ? "불러오는 중" : "유튜브 영상")}</div>
         </div>
         <div className="player"><div ref={yt.hostRef} /></div>
         {rec && load.state === "ready" && (
@@ -107,6 +107,7 @@ export default function StudyPage() {
       )}
       {rec && load.state === "ready" && (
         <>
+          {!rec.punctFixed && tab !== "expr" && needsPunctuation(rec.sentences) && <PunctuateBanner rec={rec} save={save} />}
           {tab === "watch" && <WatchTab rec={rec} yt={yt} settings={settings} setSettings={setSettings} onPick={(i) => { save({ ...rec, cursor: i }); setTab("drill"); }} />}
           {tab === "drill" && <DrillTab rec={rec} save={save} yt={yt} settings={settings} setSettings={setSettings} />}
           {tab === "expr" && <ExprTab rec={rec} save={save} yt={yt} />}
@@ -626,6 +627,100 @@ function ResetButton({ onReset }: { onReset: () => void }) {
     <button className="btn ghost" onClick={() => (armed ? onReset() : setArmed(true))}>
       {armed ? "한 번 더 누르면 번역·표현이 지워져요" : "분석 다시 하기"}
     </button>
+  );
+}
+
+/* ---------- 자동 자막 문장 나누기 ---------- */
+let apiEnabledP: Promise<boolean> | null = null;
+function useApiEnabled() {
+  const [on, setOn] = useState<boolean | null>(null);
+  useEffect(() => {
+    apiEnabledP ??= fetch("/api/analyze").then((r) => r.json()).then((j) => !!j.enabled).catch(() => false);
+    apiEnabledP.then(setOn);
+  }, []);
+  return on;
+}
+
+const PUNCT_CHUNK_WORDS = 350;
+
+function PunctuateBanner({ rec, save }: { rec: VideoRecord; save: (v: VideoRecord) => void }) {
+  const apiOn = useApiEnabled();
+  const [open, setOpen] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [err, setErr] = useState("");
+  const [paste, setPaste] = useState("");
+  const [copied, setCopied] = useState(false);
+  const hasWork = rec.done.length > 0 || !!rec.analysis;
+
+  const finish = (text: string) => {
+    const sentences = applyPunctuation(rec.sentences, text);
+    if (sentences.length < 2) return setErr("결과에서 문장을 찾지 못했어요. 답변 전체를 붙여넣었는지 확인해 주세요.");
+    save({ ...rec, sentences, done: [], cursor: 0, analysis: undefined, punctFixed: true });
+  };
+
+  const runApi = async () => {
+    setErr("");
+    const words = plainText(rec.sentences).split(" ");
+    const parts: string[] = [];
+    for (let k = 0; k < words.length; k += PUNCT_CHUNK_WORDS) parts.push(words.slice(k, k + PUNCT_CHUNK_WORDS).join(" "));
+    const out: string[] = [];
+    try {
+      for (let k = 0; k < parts.length; k++) {
+        setProgress(parts.length > 1 ? `${k + 1}/${parts.length}` : "");
+        const r = await fetch("/api/punctuate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: parts[k] }) });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error);
+        out.push(j.text);
+      }
+      finish(out.join(" "));
+    } catch (e) {
+      const c = (e as Error).message;
+      setErr(c === "rate_limited" ? "요청이 많아요. 1분 뒤 다시 눌러주세요." : c === "bad_key" ? "API 키가 맞지 않아요." : "문장 나누기에 실패했어요. 다시 눌러주세요.");
+    }
+    setProgress(null);
+  };
+
+  const copyPrompt = async () => {
+    try {
+      await navigator.clipboard.writeText(buildPunctuatePrompt(plainText(rec.sentences)));
+      setCopied(true);
+    } catch {
+      setErr("복사가 안 됐어요. 다시 눌러주세요.");
+    }
+  };
+
+  return (
+    <div className="body" style={{ paddingBottom: 0 }}>
+      <div className="notice" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div>
+          <b>자동 자막이라 마침표가 없어요.</b>
+          <div className="small">그래서 문장이 중간에서 잘려요. AI가 단어는 그대로 두고 문장부호만 찍으면 문장 단위로 다시 나눌게요.
+            {hasWork && " 다시 나누면 진행 기록과 분석한 표현은 초기화돼요."}</div>
+        </div>
+        <div className="row">
+          {apiOn ? (
+            <button className="btn primary" onClick={runApi} disabled={progress !== null}>
+              {progress !== null ? `나누는 중... ${progress}` : "AI로 문장 나누기"}
+            </button>
+          ) : (
+            <button className="btn primary" onClick={() => setOpen((o) => !o)}>AI로 문장 나누기</button>
+          )}
+          <button className="btn ghost" onClick={() => save({ ...rec, punctFixed: true })}>그냥 쓰기</button>
+        </div>
+        {apiOn === false && open && (
+          <>
+            <ol className="howto">
+              <li>프롬프트를 복사해요. <button className="btn" onClick={copyPrompt}>{copied ? "복사됨" : "프롬프트 복사"}</button></li>
+              <li><a href="https://claude.ai/new" target="_blank" rel="noopener">Claude</a>나 ChatGPT 새 대화에 붙여넣어요.</li>
+              <li>받은 답을 통째로 아래 칸에 붙여넣어요.</li>
+            </ol>
+            <textarea className="textarea" placeholder="AI 답변 붙여넣기" value={paste} onChange={(e) => { setPaste(e.target.value); setErr(""); }} aria-label="AI 답변" />
+            <button className="btn primary" disabled={!paste.trim()} onClick={() => finish(paste)}>적용</button>
+          </>
+        )}
+        {err && <div className="err">{err}</div>}
+      </div>
+    </div>
   );
 }
 

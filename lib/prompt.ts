@@ -118,3 +118,17 @@ export function toPlatformFormat(e: Expression, source?: string): string {
     `REVIEW: ${cloze && cloze !== source ? cloze : e.why}`,
   ].join("\n");
 }
+
+/** 자동 자막 문장부호 넣기 프롬프트 */
+export function buildPunctuatePrompt(text: string): string {
+  return `This is an auto-generated English transcript from a YouTube video. It has no punctuation.
+Add punctuation (. , ? !) and capitalization so it reads as natural sentences.
+
+Rules:
+- Keep every word exactly as it is, in the same order. Do not add, remove, fix or reorder any word, even repeated words or misheard words.
+- Only add punctuation marks and change capitalization.
+- Reply with only the punctuated transcript, as one paragraph, no other text.
+
+Transcript:
+${text}`;
+}
